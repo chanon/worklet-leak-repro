@@ -1,0 +1,45 @@
+diff --git a/src/memory/serializableMappingCache.native.ts b/src/memory/serializableMappingCache.native.ts
+index f270194..ab60409 100644
+--- a/src/memory/serializableMappingCache.native.ts
++++ b/src/memory/serializableMappingCache.native.ts
+@@ -21,11 +21,37 @@ During cloning we use `Object.entries` to iterate over the keys which throws an
+ For convenience we moved this cache to a separate file so it doesn't scare us with red squiggles.
+ */
+ 
+-const cache = new WeakMap<object, SerializableRef | symbol>();
++// LEAK FIX: store the cached holder WEAKLY.
++//
++// Previously this WeakMap's VALUES were strong. A WeakMap only weak-references its
++// KEYS, so any strongly-reachable key pinned its holder value forever:
++//   - a callback held by __remoteFunctionRegistry (registry keeps it alive so the
++//     UI thread can invoke it), or
++//   - a worklet `fun` held by a React ref (e.g. useAnimatedStyle's
++//     styleUpdaterContainer.current).
++// The holder's NativeState owns the shared_ptr<SerializableRemoteFunction>, whose
++// destructor is the ONLY thing that calls __remoteFunctionRegistry.delete(id). So
++// the strong value made registry entries immortal (registry -> key -> holder ->
++// shared_ptr -> never destructed -> registry never pruned).
++//
++// With a WeakRef value, the holder is collectable once nothing else references it
++// (i.e. once no live worklet still needs it); its destructor then runs and the
++// registry entry is freed. Dedup still works while the holder is alive; if it has
++// been collected, get() returns undefined and the value is simply re-serialized.
++const cache = new WeakMap<object, WeakRef<object> | symbol>();
+ 
+ export const serializableMappingCache = {
+   set(serializable: object, serializableRef?: SerializableRef): void {
+-    cache.set(serializable, serializableRef || serializableMappingFlag);
++    cache.set(
++      serializable,
++      serializableRef ? new WeakRef(serializableRef as object) : serializableMappingFlag
++    );
++  },
++  get(serializable: object): SerializableRef | symbol | undefined {
++    const entry = cache.get(serializable);
++    if (entry === undefined || entry === serializableMappingFlag) {
++      return entry as symbol | undefined;
++    }
++    return (entry as WeakRef<object>).deref() as SerializableRef | undefined;
+   },
+-  get: cache.get.bind(cache),
+ };

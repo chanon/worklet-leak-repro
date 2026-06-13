@@ -1,0 +1,5 @@
+# pnpm 11 reads structured settings from here (no longer from package.json's "pnpm" field).
+# Apply the worklets leak fix natively at install time — no postinstall script,
+# works under --ignore-scripts.
+patchedDependencies:
+  react-native-worklets@0.9.1: patches/react-native-worklets+0.9.1.patch

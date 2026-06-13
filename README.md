@@ -7,8 +7,13 @@ component unmounts, not under GC pressure. The JS heap ratchets and Hermes GC co
 until the whole app is uniformly slow; only a JS reload (fresh heap) restores speed.
 
 This is a bare React Native project that makes the leak directly observable: a live
-`__remoteFunctionRegistry.size` readout plus three buttons that grow it. Watch the size
-climb and never come back down.
+`__remoteFunctionRegistry.size` readout plus buttons that grow it.
+
+> **You are on the `patched` branch.** It carries the fix as a native **pnpm patch**
+> (`pnpm-workspace.yaml` → `patches/react-native-worklets+0.9.1.patch`), applied automatically at
+> `pnpm install` with **no `postinstall` script**. Installed and run here, the registry **drops
+> back toward baseline on GC** instead of leaking. For the unpatched leak, check out `main`. See
+> [Testing the fix](#testing-the-fix).
 
 ## Versions (pinned)
 
@@ -37,7 +42,46 @@ pnpm android
 
 Then start Metro (if it isn't already): `pnpm start`. To observe the registry live, open React Native DevTools (Dev Menu → "Open DevTools") and use the Console: `globalThis.__remoteFunctionRegistry.size`.
 
-## What you should see
+## Testing the fix
+
+The fix is one change to `react-native-worklets`: `serializableMappingCache` stores its values as `WeakRef` instead of strong references, so a strongly-held key (a callback pinned by `__remoteFunctionRegistry`, or a worklet `fun` pinned by a React ref) no longer pins the holder that owns the `SerializableRemoteFunction` `shared_ptr`. The destructor can then run and prune the registry entry — turning a permanent leak into ordinary GC-reclaimable memory.
+
+### How it's applied (no install script)
+
+`pnpm install` applies the patch automatically via `pnpm-workspace.yaml`:
+
+```yaml
+patchedDependencies:
+  react-native-worklets@0.9.1: patches/react-native-worklets+0.9.1.patch
+```
+
+pnpm patches the dependency natively at install time — there is **no `postinstall` script**, so it also works under `--ignore-scripts`. Confirm the patch is active:
+
+```sh
+grep -c "LEAK FIX" node_modules/react-native-worklets/src/memory/serializableMappingCache.native.ts
+# → 1   (pnpm-lock.yaml also records it under patchedDependencies)
+```
+
+### Verify the registry now drains
+
+Run the app and watch `registry.size`. Unlike `main`, the entries are reclaimed on GC:
+
+| Steps | Result |
+| --- | --- |
+| **1. Serialize 200** → **3. GC pressure (JS runtime)** *and* **3b. UI-thread GC pressure** | one-shot entries drop back toward baseline |
+| **2. Mount 200 → …unmount** → **3b. UI-thread GC pressure** | mapper entries drop back toward baseline |
+| Animation **canary** (top-right square) | keeps pulsing — persistent worklets unaffected |
+
+An entry is freed only once *every* holder of its `shared_ptr` is collected, and those holders can live on either runtime. The one-shot path runs its worklet on the UI thread, so it has a holder on **both** the JS and UI runtimes — it needs a GC on **both** to drain. The mapper path clears on a **UI**-runtime GC. DevTools' "collect garbage" only touches the JS runtime, which is why there's a dedicated UI-thread GC button. Under normal app use both runtimes GC on their own, so the registry stays bounded instead of growing forever.
+
+### A/B against the leak
+
+```sh
+git checkout main    && pnpm install   # unpatched → registry climbs, never drops
+git checkout patched && pnpm install   # patched   → registry drops on GC
+```
+
+## What you should see (unpatched — i.e. `main`)
 
 The app shows `registry.size`, a baseline captured at first paint, and the delta. Then:
 
@@ -144,9 +188,46 @@ lives, that `shared_ptr` is held, so `~SerializableRemoteFunction()` is never ca
 `registry.delete(id)` is never scheduled, so the entry is immortal — and with it the captured
 JS function and its entire closure environment.
 
-The broken link to fix upstream is step 1/2: worklets are retained unconditionally, and the
-retained UI-side closure handle keeps every captured remote function's `shared_ptr` alive for
-the life of the worklet runtime.
+There is a **second, RN-side pin** as well: `serializableMappingCache`
+(`src/memory/serializableMappingCache.native.ts`) is a `WeakMap` keyed by the original
+function/worklet, but its **values are strong**. A `WeakMap` only weakly references its *keys*,
+so a key kept alive by something else — a callback pinned by `__remoteFunctionRegistry`, or a
+worklet `fun` pinned by a React ref (e.g. `useAnimatedStyle`'s `styleUpdaterContainer.current`)
+— pins its holder value forever, holding the `shared_ptr` independently of the UI runtime.
+
+**The fix on this branch weakens that cache** (store values via `WeakRef`). The holder then
+becomes collectable once no live worklet needs it; collecting it frees the
+`RetainingSerializable` (and with it `secondaryValue_`), the destructor runs, and
+`registry.delete(id)` finally fires. One localized change clears both the RN-side and UI-side
+pins. See [Testing the fix](#testing-the-fix).
+
+## The fix (this branch's patch)
+
+One file changes — `react-native-worklets/src/memory/serializableMappingCache.native.ts`. The dedup cache stops pinning its values by storing them as `WeakRef`:
+
+```diff
+-const cache = new WeakMap<object, SerializableRef | symbol>();
++const cache = new WeakMap<object, WeakRef<object> | symbol>();
+
+ export const serializableMappingCache = {
+   set(serializable, serializableRef) {
+-    cache.set(serializable, serializableRef || serializableMappingFlag);
++    cache.set(serializable, serializableRef ? new WeakRef(serializableRef) : serializableMappingFlag);
+   },
+-  get: cache.get.bind(cache),
++  get(serializable) {
++    const entry = cache.get(serializable);
++    if (entry === undefined || entry === serializableMappingFlag) return entry;
++    return entry.deref();   // undefined if the holder was GC'd → caller re-serializes
++  },
+ };
+```
+
+A `WeakMap` only weakly references its **keys**; here the **values** were strong. That is what let a registry-pinned callback (or a worklet `fun` held by a React ref) keep its holder — and the holder's `shared_ptr<SerializableRemoteFunction>` — alive forever. Storing the value as a `WeakRef` lets the holder be collected once nothing else references it; the destructor then runs and `registry.delete(id)` finally fires. One localized change clears both the RN-side cache pin and (transitively, by letting the `RetainingSerializable` die) the UI-side `secondaryValue_` pin.
+
+Dedup is preserved while a holder is alive — the common case of several concurrently-live worklets capturing the same function still share one holder. The only behavioural change: if a holder has already been collected and the same source is captured again, `get()` returns `undefined` and the value is re-serialized (a fresh id/entry — itself collectable). That's lost-dedup overhead on a cold path, not a leak.
+
+The complete patch (with the explanatory comment) is `patches/react-native-worklets+0.9.1.patch`, applied at install via pnpm — see [Testing the fix](#testing-the-fix).
 
 ## Application-side workaround (for reference)
 

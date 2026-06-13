@@ -32,7 +32,12 @@ import {
   useColorScheme,
 } from 'react-native';
 import {SafeAreaProvider, SafeAreaView} from 'react-native-safe-area-context';
-import Animated, {useAnimatedStyle} from 'react-native-reanimated';
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withTiming,
+} from 'react-native-reanimated';
 import {runOnJS, runOnUI} from 'react-native-worklets';
 
 const BATCH = 200;
@@ -94,6 +99,22 @@ function LeakerNode(): React.JSX.Element {
 }
 
 // ---------------------------------------------------------------------------
+// Animation canary — a VISIBLE persistent-worklet (useAnimatedStyle + withRepeat).
+// Used to check the fix experiment doesn't break long-lived worklets: if the patch
+// (honor shouldPersistRemote → animated worklets become non-retaining) breaks them,
+// this box stops pulsing.
+// ---------------------------------------------------------------------------
+
+function AnimationCanary({color}: {color: string}): React.JSX.Element {
+  const t = useSharedValue(0);
+  useEffect(() => {
+    t.value = withRepeat(withTiming(1, {duration: 700}), -1, true);
+  }, [t]);
+  const style = useAnimatedStyle(() => ({opacity: 0.15 + 0.85 * t.value}));
+  return <Animated.View style={[styles.canary, {backgroundColor: color}, style]} />;
+}
+
+// ---------------------------------------------------------------------------
 // GC pressure — allocate and drop a lot, plus call global.gc() if exposed. Shows
 // the retention is a strong reference in the serializable lifecycle, not GC laziness.
 // ---------------------------------------------------------------------------
@@ -110,6 +131,27 @@ function gcPressure(): void {
   if (typeof g.gc === 'function') {
     g.gc();
   }
+}
+
+// Force GC on the UI (worklet) runtime — a SEPARATE Hermes heap that DevTools'
+// "collect garbage" does not touch. The mapper (useAnimatedStyle) worklet lives
+// here, so its captured remote function's shared_ptr is released only when the UI
+// runtime collects it. This runs the same allocation pressure on the UI thread.
+function uiGcPressure(): void {
+  runOnUI(() => {
+    'worklet';
+    for (let round = 0; round < 20; round++) {
+      let junk: number[][] | null = [];
+      for (let i = 0; i < 200; i++) {
+        junk.push(new Array(10000).fill(i));
+      }
+      junk = null;
+    }
+    const g = globalThis as {gc?: () => void};
+    if (typeof g.gc === 'function') {
+      g.gc();
+    }
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +186,11 @@ function App(): React.JSX.Element {
     gcPressure();
     setSize(registrySize());
   }, []);
+  const onUiGc = useCallback(() => {
+    uiGcPressure();
+    // give the UI-runtime GC + cross-thread registry.delete a moment to land
+    setTimeout(() => setSize(registrySize()), 1200);
+  }, []);
   const onRebase = useCallback(() => setBaseline(registrySize()), []);
 
   const delta = baseline === null ? size : size - baseline;
@@ -156,9 +203,13 @@ function App(): React.JSX.Element {
           <Text style={[styles.title, {color: c.text}]}>
             worklets __remoteFunctionRegistry leak
           </Text>
-          <Text style={[styles.sub, {color: c.subtle}]}>
-            reanimated 4.4.1 · worklets 0.9.1 · RN 0.85.3
-          </Text>
+          <View style={styles.headerRow}>
+            <Text style={[styles.sub, {color: c.subtle}]}>
+              reanimated 4.4.1 · worklets 0.9.1 · RN 0.85.3
+            </Text>
+            {/* canary: must keep pulsing for persistent worklets to be OK */}
+            <AnimationCanary color={c.accent} />
+          </View>
 
           <View style={[styles.card, {backgroundColor: c.card}]}>
             <Stat label="registry.size" value={fmt(size)} color={c.text} big />
@@ -191,7 +242,8 @@ function App(): React.JSX.Element {
             c={c}
           />
           <Btn label="   …then unmount them all" onPress={onUnmount} c={c} />
-          <Btn label="3. GC pressure (size won't drop)" onPress={onGc} c={c} />
+          <Btn label="3. GC pressure (JS runtime)" onPress={onGc} c={c} />
+          <Btn label="3b. UI-thread GC pressure" onPress={onUiGc} c={c} />
           <Btn label="Reset baseline" onPress={onRebase} c={c} subtle />
 
           <Text style={[styles.note, {color: c.subtle}]}>
@@ -297,6 +349,13 @@ const styles = StyleSheet.create({
   btn: {borderRadius: 12, paddingVertical: 14, paddingHorizontal: 16},
   btnText: {fontSize: 15, fontWeight: '600'},
   note: {fontSize: 13, lineHeight: 19, marginTop: 8},
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: -6,
+  },
+  canary: {width: 36, height: 36, borderRadius: 8},
   stage: {
     position: 'absolute',
     right: 0,
