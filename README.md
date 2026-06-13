@@ -24,14 +24,18 @@ climb and never come back down.
 
 ## Run
 
+This project uses **pnpm** (an `.npmrc` sets `node-linker=hoisted` so React Native's Metro resolver, community-CLI autolinking, and CocoaPods get the flat `node_modules` they expect). Install pnpm first if needed: `npm i -g pnpm` (or `corepack enable`).
+
 ```sh
-npm install
+pnpm install
 # iOS
 cd ios && pod install && cd ..
-npx react-native run-ios          # or: open the .xcworkspace in Xcode and Run
+pnpm ios            # or: open ios/WorkletLeakRepro.xcworkspace in Xcode and Run
 # Android
-npx react-native run-android
+pnpm android
 ```
+
+Then start Metro (if it isn't already): `pnpm start`. To observe the registry live, open React Native DevTools (Dev Menu → "Open DevTools") and use the Console: `globalThis.__remoteFunctionRegistry.size`.
 
 ## What you should see
 
