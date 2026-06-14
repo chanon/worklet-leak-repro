@@ -44,7 +44,9 @@ Then start Metro (if it isn't already): `pnpm start`. To observe the registry li
 
 ## Testing the fix
 
-The fix is one change to `react-native-worklets`: `serializableMappingCache` stores its values as `WeakRef` instead of strong references, so a strongly-held key (a callback pinned by `__remoteFunctionRegistry`, or a worklet `fun` pinned by a React ref) no longer pins the holder that owns the `SerializableRemoteFunction` `shared_ptr`. The destructor can then run and prune the registry entry — turning a permanent leak into ordinary GC-reclaimable memory.
+The fix makes `serializableMappingCache` store its value as a `WeakRef` **only for the serializables that drive the leak** — remote-function holders, worklet holders, and plain-object holders (a worklet capturing an object with function members) — so a strongly-held key (a callback pinned by `__remoteFunctionRegistry`, or a worklet `fun` pinned by a React ref) no longer pins the holder that owns the `SerializableRemoteFunction` `shared_ptr`. The destructor can then run and prune the registry entry — turning a permanent leak into ordinary GC-reclaimable memory.
+
+Identity-critical serializables — **shared values (Mutables) and host objects** — stay **strongly** cached, exactly as before. Those rely on the cache to dedup to a single serialized handle; weakening them re-serializes a fresh handle under GC and causes stale reactive state (e.g. a selection highlight that won't clear, a tool overlay that flickers to a stale position). So the fix is deliberately scoped: weak for stateless/function-bearing holders, strong for identity-bearing ones.
 
 ### How it's applied (no install script)
 
@@ -195,39 +197,52 @@ so a key kept alive by something else — a callback pinned by `__remoteFunction
 worklet `fun` pinned by a React ref (e.g. `useAnimatedStyle`'s `styleUpdaterContainer.current`)
 — pins its holder value forever, holding the `shared_ptr` independently of the UI runtime.
 
-**The fix on this branch weakens that cache** (store values via `WeakRef`). The holder then
+**The fix on this branch weakens that cache for the leak-driving holders only** (functions,
+worklets, plain objects — via `WeakRef`; shared values and host objects stay strong). The holder then
 becomes collectable once no live worklet needs it; collecting it frees the
 `RetainingSerializable` (and with it `secondaryValue_`), the destructor runs, and
-`registry.delete(id)` finally fires. One localized change clears both the RN-side and UI-side
+`registry.delete(id)` finally fires. This clears both the RN-side and UI-side
 pins. See [Testing the fix](#testing-the-fix).
 
 ## The fix (this branch's patch)
 
-One file changes — `react-native-worklets/src/memory/serializableMappingCache.native.ts`. The dedup cache stops pinning its values by storing them as `WeakRef`:
+Two files change — `serializableMappingCache.native.ts` (the cache gains an opt-in `weak` flag) and `serializable.native.ts` (three call sites request `weak`). The cache stores its value as a `WeakRef` **only when `weak` is passed**; everything else stays strong as before.
 
 ```diff
+# serializableMappingCache.native.ts
 -const cache = new WeakMap<object, SerializableRef | symbol>();
-+const cache = new WeakMap<object, WeakRef<object> | symbol>();
++const cache = new WeakMap<object, SerializableRef | WeakRef<object> | symbol>();
 
  export const serializableMappingCache = {
-   set(serializable, serializableRef) {
+-  set(serializable, serializableRef) {
 -    cache.set(serializable, serializableRef || serializableMappingFlag);
-+    cache.set(serializable, serializableRef ? new WeakRef(serializableRef) : serializableMappingFlag);
++  set(serializable, serializableRef, weak) {
++    if (!serializableRef) { cache.set(serializable, serializableMappingFlag); return; }
++    cache.set(serializable, weak ? new WeakRef(serializableRef) : serializableRef);
    },
 -  get: cache.get.bind(cache),
 +  get(serializable) {
 +    const entry = cache.get(serializable);
 +    if (entry === undefined || entry === serializableMappingFlag) return entry;
-+    return entry.deref();   // undefined if the holder was GC'd → caller re-serializes
++    if (entry instanceof WeakRef) return entry.deref(); // undefined if GC'd → re-serialize
++    return entry;                                        // strong (identity-critical) — unchanged
 +  },
  };
+
+# serializable.native.ts — request weak only for the leak-driving holders:
+-  serializableMappingCache.set(fun, clone);     // cloneNonWorkletFunction
++  serializableMappingCache.set(fun, clone, true);
+-  serializableMappingCache.set(value, clone);   // cloneWorklet
++  serializableMappingCache.set(value, clone, true);
+-  serializableMappingCache.set(value, clone);   // clonePlainJSObject
++  serializableMappingCache.set(value, clone, true);
 ```
 
-A `WeakMap` only weakly references its **keys**; here the **values** were strong. That is what let a registry-pinned callback (or a worklet `fun` held by a React ref) keep its holder — and the holder's `shared_ptr<SerializableRemoteFunction>` — alive forever. Storing the value as a `WeakRef` lets the holder be collected once nothing else references it; the destructor then runs and `registry.delete(id)` finally fires. One localized change clears both the RN-side cache pin and (transitively, by letting the `RetainingSerializable` die) the UI-side `secondaryValue_` pin.
+A `WeakMap` only weakly references its **keys**; the **values** were strong. That is what let a registry-pinned callback (or a worklet `fun` held by a React ref) keep its holder — and the holder's `shared_ptr<SerializableRemoteFunction>` — alive forever. Weakly caching the holder lets it be collected once nothing else references it; the destructor then runs and `registry.delete(id)` finally fires (and, transitively, the `RetainingSerializable` dies, releasing the UI-side `secondaryValue_` pin).
 
-Dedup is preserved while a holder is alive — the common case of several concurrently-live worklets capturing the same function still share one holder. The only behavioural change: if a holder has already been collected and the same source is captured again, `get()` returns `undefined` and the value is re-serialized (a fresh id/entry — itself collectable). That's lost-dedup overhead on a cold path, not a leak.
+**Why only those three** (functions, worklets, plain objects): they're stateless/value-like, so re-serializing on a cache miss is harmless, and plain objects are the container that carries captured function members. **Shared values (Mutables) and host objects stay strong** — they need the cache to map to one stable serialized handle; weakening them re-serializes a fresh handle under GC and desyncs reactive state. Dedup is still preserved for the weak kinds while a holder is alive; the only cost is re-serialization of a long-idle holder that's captured again (a fresh, itself-collectable entry) — overhead on a cold path, not a leak.
 
-The complete patch (with the explanatory comment) is `patches/react-native-worklets+0.9.1.patch`, applied at install via pnpm — see [Testing the fix](#testing-the-fix).
+The complete patch is `patches/react-native-worklets+0.9.1.patch`, applied at install via pnpm — see [Testing the fix](#testing-the-fix).
 
 ## Application-side workaround (for reference)
 
